@@ -105,24 +105,25 @@ Use `/chat` when you want normal chatbot mode without tools.
 ## Commands
 
 ```text
-/agent        Toggle agent mode
-/chat         Chat-only mode
-/think        Toggle DeepSeek reasoning on/off
-/thinkstream  Toggle reasoning text vs animation-only display
-/workspace    Show or set the agent workspace path
-/tools        Show available agent tools
-/steps N      Set max agent tool steps for one task
-/usage        Show token usage
-/new          Start a fresh chat session
-/clear        Clear transcript
-/help         Show help
-/quit         Exit
+/agent        Toggle agent tools.
+/chat         Switch to chat-only mode.
+/search       Toggle DeepSeek web search.
+/think        Toggle DeepSeek reasoning.
+/thinkstream  Show reasoning text or animation only.
+/workspace    Show or change the active workspace (takes path).
+/tools        List available agent tools.
+/new          Start a new chat session.
+/clear        Clear the transcript.
+/help         Show command help.
+/quit         Exit DeepSeek Terminal Studio.
+/exit         Exit DeepSeek Terminal Studio.
 ```
 
 ## Keybindings
 
 ```text
 Ctrl+A   Toggle agent mode
+Ctrl+R   Toggle web search
 Ctrl+T   Toggle reasoning
 Ctrl+N   New session
 Ctrl+L   Clear transcript
