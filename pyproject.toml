@@ -1,0 +1,19 @@
+[project]
+name = "deepseek-terminal-studio"
+version = "0.1.0"
+description = "Reasoning-aware DeepSeek terminal TUI"
+requires-python = ">=3.10"
+dependencies = [
+  "textual>=0.70.0",
+  "rich>=13.0.0",
+  "requests",
+  "wasmtime",
+  "numpy",
+  "tokenizers>=0.15.0",
+]
+
+[project.scripts]
+deepseek-studio = "deepseek_studio.app:main"
+
+[tool.ruff]
+line-length = 100
