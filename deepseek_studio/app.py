@@ -37,6 +37,7 @@ class DeepSeekTUI(App[None]):
         Binding("ctrl+t", "toggle_thinking", "Thinking", show=False),
         Binding("ctrl+n", "new_session", "New chat", show=False),
         Binding("ctrl+l", "clear_chat", "Clear", show=False),
+        Binding("ctrl+s", "toggle_sidebar", "Sidebar", show=False),
     ]
 
     def __init__(self) -> None:
@@ -446,6 +447,12 @@ class DeepSeekTUI(App[None]):
         mode = "streaming text" if self.state.thinking_stream_enabled else "animation only"
         self._system(f"Thinking display mode: {mode}")
         self._refresh_status("Ready")
+
+    def action_toggle_sidebar(self) -> None:
+        """Toggle sidebar visibility."""
+        sidebar = self.query_one("#sidebar")
+        sidebar.display = not sidebar.display
+        self._system(f"Sidebar {'hidden' if not sidebar.display else 'shown'}")
 
     def _show_tools(self) -> None:
         if not self.agent_runner:

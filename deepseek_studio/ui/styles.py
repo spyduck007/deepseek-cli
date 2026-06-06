@@ -31,7 +31,7 @@ Header {
     scrollbar-color: #38486a #111827;
 }
 
-#logo {
+#simple-title {
     width: 100%;
     height: auto;
     color: #7aa2ff;
@@ -138,9 +138,9 @@ Header {
 }
 
 #composer {
-    height: 18;
-    min-height: 13;
-    max-height: 21;
+    height: 14;
+    min-height: 10;
+    max-height: 16;
     layout: vertical;
     border: tall #24324d;
     background: #0d1320;
@@ -157,9 +157,9 @@ Header {
 #command-menu {
     width: 100%;
     height: auto;
-    max-height: 7;
-    margin: 1 0 0 0;
-    padding: 1 2;
+    max-height: 6;
+    margin: 0;
+    padding: 0 2;
     border: round #405475;
     background: #0b1220;
     color: #c6d3f5;
@@ -169,7 +169,7 @@ Header {
 #prompt {
     width: 100%;
     height: 1fr;
-    min-height: 4;
+    min-height: 3;
     border: round #38527f;
     background: #050910;
     color: #f4f7ff;

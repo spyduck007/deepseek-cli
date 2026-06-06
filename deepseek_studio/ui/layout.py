@@ -6,7 +6,7 @@ from textual.app import ComposeResult
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.widgets import Header, Static
 
-from ..constants import LOGO, TAGLINE
+from ..constants import TAGLINE
 from .widgets import PromptTextArea
 
 
@@ -15,7 +15,7 @@ def compose_shell() -> ComposeResult:
     yield Header(show_clock=True)
     with Horizontal(id="main"):
         with VerticalScroll(id="sidebar"):
-            yield Static(LOGO, id="logo")
+            yield Static("DeepSeek Studio", id="simple-title")
             yield Static(TAGLINE, id="tagline")
             yield Static("", id="status-card")
             yield Static("", id="token-card")
