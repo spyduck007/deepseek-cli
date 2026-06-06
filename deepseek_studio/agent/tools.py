@@ -205,6 +205,103 @@ class ToolRegistry:
             ),
             self.apply_patch,
         )
+        # Git tools
+        self._register(
+            ToolSpec(
+                "git_status",
+                "Show the working tree status.",
+                {},
+            ),
+            self.git_status,
+        )
+        self._register(
+            ToolSpec(
+                "git_diff",
+                "Show differences between commits, working tree, etc.",
+                {
+                    "paths": "optional paths to diff (default empty for all)",
+                    "staged": "boolean, diff staged changes only, default false",
+                },
+            ),
+            self.git_diff,
+        )
+        self._register(
+            ToolSpec(
+                "git_add",
+                "Add file contents to the index.",
+                {
+                    "paths": "paths to add, default '.'",
+                    "all_changes": "boolean, add all changes (including deletions), default false",
+                },
+            ),
+            self.git_add,
+        )
+        self._register(
+            ToolSpec(
+                "git_commit",
+                "Commit changes to the repository.",
+                {
+                    "message": "commit message (required)",
+                    "all_changes": "boolean, automatically stage all tracked files, default false",
+                },
+            ),
+            self.git_commit,
+        )
+        self._register(
+            ToolSpec(
+                "git_pull",
+                "Pull changes from a remote repository.",
+                {
+                    "remote": "remote name, default 'origin'",
+                    "branch": "branch name, optional",
+                },
+            ),
+            self.git_pull,
+        )
+        self._register(
+            ToolSpec(
+                "git_push",
+                "Push changes to a remote repository.",
+                {
+                    "remote": "remote name, default 'origin'",
+                    "branch": "branch name, optional",
+                    "force": "boolean, force push, default false",
+                },
+            ),
+            self.git_push,
+        )
+        self._register(
+            ToolSpec(
+                "git_log",
+                "Show commit logs.",
+                {
+                    "count": "number of commits to show, default 10, max 100",
+                    "oneline": "boolean, show each commit on one line, default true",
+                },
+            ),
+            self.git_log,
+        )
+        self._register(
+            ToolSpec(
+                "git_branch",
+                "List or show branches.",
+                {
+                    "list_all": "boolean, list both local and remote branches, default false",
+                },
+            ),
+            self.git_branch,
+        )
+        self._register(
+            ToolSpec(
+                "git_checkout",
+                "Switch branches or restore working tree files.",
+                {
+                    "target": "branch name or commit hash to switch to",
+                    "new_branch": "optional, create and switch to a new branch",
+                },
+            ),
+            self.git_checkout,
+        )
 
     def workspace_info(self) -> ToolResult:
         files = []
@@ -443,6 +540,136 @@ class ToolRegistry:
                 os.unlink(patch_path)
             except OSError:
                 pass
+
+    # Git/GitHub tools
+
+    def _git_command(self, args: list[str], timeout: int = 30) -> tuple[bool, str]:
+        """Run a git command and return (success, output)."""
+        try:
+            proc = subprocess.run(
+                ["git"] + args,
+                cwd=self.workspace,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+            output = proc.stdout.strip()
+            if proc.stderr:
+                output += "\n" + proc.stderr.strip()
+            return proc.returncode == 0, output
+        except subprocess.TimeoutExpired as exc:
+            return False, f"Command timed out after {timeout}s: git {' '.join(args)}"
+        except FileNotFoundError:
+            return False, "Git is not installed or not in PATH."
+
+    def git_status(self) -> ToolResult:
+        """Show the working tree status."""
+        ok, output = self._git_command(["status", "--short"])
+        if not ok:
+            return ToolResult(False, f"git status failed: {output}")
+        return ToolResult(True, output if output else "Working tree clean.")
+
+    def git_diff(self, paths: str = "", staged: bool = False) -> ToolResult:
+        """Show differences between commits, working tree, etc."""
+        args = ["diff"]
+        if staged:
+            args.append("--staged")
+        if paths:
+            args.append(paths)
+        ok, output = self._git_command(args, timeout=30)
+        if not ok:
+            return ToolResult(False, f"git diff failed: {output}")
+        if not output:
+            return ToolResult(True, "No differences.")
+        # Limit output size
+        if len(output) > 12000:
+            output = output[:12000] + "\n... (truncated)"
+        return ToolResult(True, output)
+
+    def git_add(self, paths: str = ".", all_changes: bool = False) -> ToolResult:
+        """Add file contents to the index."""
+        if all_changes:
+            args = ["add", "-A"]
+        else:
+            args = ["add", paths]
+        ok, output = self._git_command(args)
+        if not ok:
+            return ToolResult(False, f"git add failed: {output}")
+        return ToolResult(True, f"Added {paths if not all_changes else 'all changes'}.")
+
+    def git_commit(self, message: str, all_changes: bool = False) -> ToolResult:
+        """Commit changes to the repository."""
+        if not message.strip():
+            return ToolResult(False, "Commit message cannot be empty.")
+        args = ["commit", "-m", message]
+        if all_changes:
+            args.insert(1, "-a")
+        ok, output = self._git_command(args)
+        if not ok:
+            return ToolResult(False, f"git commit failed: {output}")
+        return ToolResult(True, f"Committed: {message}")
+
+    def git_pull(self, remote: str = "origin", branch: str = "") -> ToolResult:
+        """Pull changes from a remote repository."""
+        args = ["pull", remote]
+        if branch:
+            args.append(branch)
+        ok, output = self._git_command(args, timeout=60)
+        if not ok:
+            return ToolResult(False, f"git pull failed: {output}")
+        return ToolResult(True, output if output else "Pull completed.")
+
+    def git_push(self, remote: str = "origin", branch: str = "", force: bool = False) -> ToolResult:
+        """Push changes to a remote repository."""
+        args = ["push", remote]
+        if branch:
+            args.append(branch)
+        if force:
+            args.append("--force")
+        ok, output = self._git_command(args, timeout=60)
+        if not ok:
+            return ToolResult(False, f"git push failed: {output}")
+        return ToolResult(True, output if output else "Push completed.")
+
+    def git_log(self, count: int = 10, oneline: bool = True) -> ToolResult:
+        """Show commit logs."""
+        count = max(1, min(int(count), 100))
+        args = ["log", f"-n{count}"]
+        if oneline:
+            args.append("--oneline")
+        ok, output = self._git_command(args)
+        if not ok:
+            return ToolResult(False, f"git log failed: {output}")
+        if not output:
+            return ToolResult(True, "No commits.")
+        return ToolResult(True, output)
+
+    def git_branch(self, list_all: bool = False) -> ToolResult:
+        """List or show branches."""
+        args = ["branch"]
+        if list_all:
+            args.append("-a")
+        ok, output = self._git_command(args)
+        if not ok:
+            return ToolResult(False, f"git branch failed: {output}")
+        return ToolResult(True, output if output else "No branches.")
+
+    def git_checkout(self, target: str, new_branch: str = "") -> ToolResult:
+        """Switch branches or restore working tree files."""
+        args = ["checkout"]
+        if new_branch:
+            args.extend(["-b", new_branch])
+        else:
+            args.append(target)
+        ok, output = self._git_command(args)
+        if not ok:
+            return ToolResult(False, f"git checkout failed: {output}")
+        if new_branch:
+            return ToolResult(True, f"Created and switched to branch '{new_branch}'.")
+        return ToolResult(True, f"Switched to '{target}'.")
+
+    # No GitHub-specific tools yet (PRs, issues) to keep dependencies minimal.
+    # They can be added later with gh CLI or PyGithub.
 
     def _safe_path(self, path: str | Path) -> Path:
         raw = Path(str(path)).expanduser()
