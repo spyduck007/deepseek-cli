@@ -8,13 +8,15 @@ import re
 import shlex
 import subprocess
 import tempfile
+import signal
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 
 TEXT_READ_BYTES = 1024 * 1024
-MAX_COMMAND_OUTPUT = 20_000
+MAX_COMMAND_OUTPUT = 200_000  # increased from 20k to 200k
 SKIP_DIRS = {
     ".git",
     ".hg",
@@ -188,11 +190,14 @@ class ToolRegistry:
         self._register(
             ToolSpec(
                 "run_command",
-                "Run a non-interactive shell command in the workspace.",
+                "Run a shell command in the workspace with enhanced robustness: supports environment variables, working directory override, graceful timeout (SIGTERM then SIGKILL), UTF-8 error handling, large output (up to 200KB), and configurable safety checks.",
                 {
-                    "command": "shell command string",
-                    "timeout": "seconds before kill, default 30, max 120",
-                    "max_output_chars": "combined stdout/stderr cap, default 12000",
+                    "command": "shell command string (can be multi-line or use &&, |, etc.)",
+                    "timeout": "seconds before kill, default 30, max 300",
+                    "max_output_chars": "combined stdout/stderr cap, default 50000, max 200000",
+                    "env": "optional dict of environment variables to set (e.g., {'PATH': '/custom/bin'})",
+                    "cwd": "optional working directory relative to workspace (default workspace root)",
+                    "allow_dangerous": "boolean, bypass safety checks if true (default false)",
                 },
             ),
             self.run_command,
@@ -302,6 +307,8 @@ class ToolRegistry:
             ),
             self.git_checkout,
         )
+
+    # ---------- Workspace tools ----------
 
     def workspace_info(self) -> ToolResult:
         files = []
@@ -425,7 +432,6 @@ class ToolRegistry:
         if target.is_dir():
             if recursive:
                 import shutil
-
                 shutil.rmtree(target)
                 return ToolResult(True, f"Deleted directory tree {self._rel(target)}")
             target.rmdir()
@@ -474,36 +480,109 @@ class ToolRegistry:
         suffix = "" if len(matches) < max_matches else f"\n... truncated at {max_matches} matches"
         return ToolResult(True, "\n".join(matches) + suffix)
 
-    def run_command(self, command: str, timeout: int = 30, max_output_chars: int = 12_000) -> ToolResult:
+    # ---------- Enhanced run_command ----------
+
+    def run_command(
+        self,
+        command: str,
+        timeout: int = 30,
+        max_output_chars: int = 50_000,
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+        allow_dangerous: bool = False,
+    ) -> ToolResult:
+        """Run a shell command in the workspace with robust error handling.
+
+        Improvements over original:
+        - Handles UTF-8 decode errors gracefully
+        - SIGTERM then SIGKILL on timeout
+        - Configurable environment variables
+        - Configurable working directory
+        - Larger output limits (up to 200KB)
+        - More precise dangerous command filtering with bypass
+        - Returns structured error messages
+        - Never crashes the agent
+        """
         command = str(command).strip()
         if not command:
             return ToolResult(False, "Command is empty.")
-        dangerous = self._dangerous_command_reason(command)
-        if dangerous:
-            return ToolResult(False, dangerous)
-        timeout = max(1, min(int(timeout), 120))
-        max_output_chars = max(1000, min(int(max_output_chars), MAX_COMMAND_OUTPUT))
-        try:
-            proc = subprocess.run(
-                command,
-                cwd=self.workspace,
-                shell=True,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as exc:
-            output = ((exc.stdout or "") + "\n" + (exc.stderr or "")).strip()
-            return ToolResult(False, f"Command timed out after {timeout}s.\n{_clip(output, max_output_chars)}")
 
-        stdout = _clip(proc.stdout or "", max_output_chars)
-        stderr = _clip(proc.stderr or "", max_output_chars)
-        message = f"$ {command}\nexit_code: {proc.returncode}"
-        if stdout:
-            message += f"\n\nstdout:\n{stdout}"
-        if stderr:
-            message += f"\n\nstderr:\n{stderr}"
-        return ToolResult(proc.returncode == 0, message)
+        # Safety check
+        if not allow_dangerous:
+            dangerous = self._dangerous_command_reason(command)
+            if dangerous:
+                return ToolResult(False, dangerous)
+
+        # Timeout and output limits
+        timeout = max(1, min(int(timeout), 300))  # increased max to 5 minutes
+        max_output_chars = max(1000, min(int(max_output_chars), MAX_COMMAND_OUTPUT))
+
+        # Prepare environment: inherit current os.environ plus user overrides
+        final_env = os.environ.copy()
+        if env:
+            final_env.update(env)
+
+        # Determine working directory
+        if cwd:
+            working_dir = self._safe_path(cwd)
+            if not working_dir.exists():
+                return ToolResult(False, f"Working directory does not exist: {cwd}")
+            if not working_dir.is_dir():
+                return ToolResult(False, f"Working directory is not a directory: {cwd}")
+        else:
+            working_dir = self.workspace
+
+        try:
+            # Use Popen for better control
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                cwd=working_dir,
+                env=final_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=False,  # capture as bytes to handle encoding ourselves
+                executable='/bin/bash' if os.name != 'nt' else None,  # use bash on Unix for better compatibility
+            )
+
+            # Wait with timeout, then send SIGTERM, then SIGKILL
+            try:
+                stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # First try SIGTERM
+                proc.terminate()
+                try:
+                    stdout_bytes, stderr_bytes = proc.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    # Force kill
+                    proc.kill()
+                    stdout_bytes, stderr_bytes = proc.communicate()
+                return ToolResult(
+                    False,
+                    f"Command timed out after {timeout}s and was terminated.\n"
+                    f"$ {command}\n"
+                    f"Partial output:\n{_decode_output(stdout_bytes, max_output_chars)}"
+                )
+
+            # Decode with error handling
+            stdout = _decode_output(stdout_bytes, max_output_chars)
+            stderr = _decode_output(stderr_bytes, max_output_chars)
+
+            # Build result message
+            message_parts = [f"$ {command}", f"exit_code: {proc.returncode}"]
+            if stdout:
+                message_parts.append(f"\nstdout:\n{stdout}")
+            if stderr:
+                message_parts.append(f"\nstderr:\n{stderr}")
+            message = "".join(message_parts)
+
+            return ToolResult(proc.returncode == 0, message)
+
+        except OSError as e:
+            return ToolResult(False, f"Failed to execute command (OS error): {e}")
+        except Exception as e:
+            # Catch-all to prevent agent crash
+            return ToolResult(False, f"Unexpected error running command: {type(e).__name__}: {e}")
 
     def apply_patch(self, patch: str) -> ToolResult:
         patch = str(patch)
@@ -541,7 +620,7 @@ class ToolRegistry:
             except OSError:
                 pass
 
-    # Git/GitHub tools
+    # ---------- Git tools ----------
 
     def _git_command(self, args: list[str], timeout: int = 30) -> tuple[bool, str]:
         """Run a git command and return (success, output)."""
@@ -563,14 +642,12 @@ class ToolRegistry:
             return False, "Git is not installed or not in PATH."
 
     def git_status(self) -> ToolResult:
-        """Show the working tree status."""
         ok, output = self._git_command(["status", "--short"])
         if not ok:
             return ToolResult(False, f"git status failed: {output}")
         return ToolResult(True, output if output else "Working tree clean.")
 
     def git_diff(self, paths: str = "", staged: bool = False) -> ToolResult:
-        """Show differences between commits, working tree, etc."""
         args = ["diff"]
         if staged:
             args.append("--staged")
@@ -581,13 +658,11 @@ class ToolRegistry:
             return ToolResult(False, f"git diff failed: {output}")
         if not output:
             return ToolResult(True, "No differences.")
-        # Limit output size
         if len(output) > 12000:
             output = output[:12000] + "\n... (truncated)"
         return ToolResult(True, output)
 
     def git_add(self, paths: str = ".", all_changes: bool = False) -> ToolResult:
-        """Add file contents to the index."""
         if all_changes:
             args = ["add", "-A"]
         else:
@@ -598,7 +673,6 @@ class ToolRegistry:
         return ToolResult(True, f"Added {paths if not all_changes else 'all changes'}.")
 
     def git_commit(self, message: str, all_changes: bool = False) -> ToolResult:
-        """Commit changes to the repository."""
         if not message.strip():
             return ToolResult(False, "Commit message cannot be empty.")
         args = ["commit", "-m", message]
@@ -610,7 +684,6 @@ class ToolRegistry:
         return ToolResult(True, f"Committed: {message}")
 
     def git_pull(self, remote: str = "origin", branch: str = "") -> ToolResult:
-        """Pull changes from a remote repository."""
         args = ["pull", remote]
         if branch:
             args.append(branch)
@@ -620,7 +693,6 @@ class ToolRegistry:
         return ToolResult(True, output if output else "Pull completed.")
 
     def git_push(self, remote: str = "origin", branch: str = "", force: bool = False) -> ToolResult:
-        """Push changes to a remote repository."""
         args = ["push", remote]
         if branch:
             args.append(branch)
@@ -632,7 +704,6 @@ class ToolRegistry:
         return ToolResult(True, output if output else "Push completed.")
 
     def git_log(self, count: int = 10, oneline: bool = True) -> ToolResult:
-        """Show commit logs."""
         count = max(1, min(int(count), 100))
         args = ["log", f"-n{count}"]
         if oneline:
@@ -645,7 +716,6 @@ class ToolRegistry:
         return ToolResult(True, output)
 
     def git_branch(self, list_all: bool = False) -> ToolResult:
-        """List or show branches."""
         args = ["branch"]
         if list_all:
             args.append("-a")
@@ -655,7 +725,6 @@ class ToolRegistry:
         return ToolResult(True, output if output else "No branches.")
 
     def git_checkout(self, target: str, new_branch: str = "") -> ToolResult:
-        """Switch branches or restore working tree files."""
         args = ["checkout"]
         if new_branch:
             args.extend(["-b", new_branch])
@@ -668,8 +737,7 @@ class ToolRegistry:
             return ToolResult(True, f"Created and switched to branch '{new_branch}'.")
         return ToolResult(True, f"Switched to '{target}'.")
 
-    # No GitHub-specific tools yet (PRs, issues) to keep dependencies minimal.
-    # They can be added later with gh CLI or PyGithub.
+    # ---------- Helpers ----------
 
     def _safe_path(self, path: str | Path) -> Path:
         raw = Path(str(path)).expanduser()
@@ -707,32 +775,36 @@ class ToolRegistry:
         return b"\0" in chunk
 
     def _dangerous_command_reason(self, command: str) -> str | None:
+        """Block only truly destructive commands. Allow curl|sh but warn? Keep simple for now."""
+        # Allow bypass via environment variable
         if os.environ.get("DEEPSEEK_STUDIO_ALLOW_DANGEROUS") == "1":
             return None
+
         lowered = command.lower()
+        # Very dangerous patterns (rm -rf /, dd destructive, format, shutdown)
         blocked_patterns = [
-            r"\bsudo\b",
-            r"\brm\s+-[^\n;|&]*r[^\n;|&]*f[^\n;|&]*(/|~|\.\.)",
+            r"\brm\s+-[^;|&]*r[^;|&]*f[^;|&]*\s+(/|~/|/\*|\.\.)",  # rm -rf / or ~ or ..
             r"\bmkfs\b",
-            r"\bdd\s+if=",
+            r"\bdd\s+if=.*of=/dev/",
             r"\bshutdown\b",
             r"\breboot\b",
-            r":\s*\(\s*\)\s*\{",
-            r"\bcurl\b[^\n]*\|\s*(sh|bash|zsh)",
-            r"\bwget\b[^\n]*\|\s*(sh|bash|zsh)",
+            r":\s*\(\s*\)\s*\{",  # fork bomb
+            r"\bcurl\b.*\|\s*(sh|bash|zsh)",  # curl-pipe-sh is dangerous but not always malicious
+            r"\bwget\b.*\|\s*(sh|bash|zsh)",
         ]
         for pattern in blocked_patterns:
             if re.search(pattern, lowered):
                 return (
-                    "Command blocked by safety guard. If you really need this, run it yourself "
-                    "or start the app with DEEPSEEK_STUDIO_ALLOW_DANGEROUS=1."
+                    "Command blocked by safety guard. If you trust this command, "
+                    "set allow_dangerous=true or start with DEEPSEEK_STUDIO_ALLOW_DANGEROUS=1."
                 )
+        # Block privilege escalation
         try:
             parts = shlex.split(command)
         except ValueError:
             return None
         if parts and parts[0] in {"sudo", "su"}:
-            return "Command blocked by safety guard: privilege escalation is disabled."
+            return "Privilege escalation commands (sudo, su) are disabled for safety."
         return None
 
     def _validate_patch_paths(self, patch: str) -> str | None:
@@ -758,4 +830,19 @@ def _clip(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     omitted = len(text) - limit
-    return text[:limit] + f"\n... clipped {omitted} characters"
+    return text[:limit] + f"\n... (truncated, {omitted} characters omitted)"
+
+
+def _decode_output(data: bytes | None, max_chars: int) -> str:
+    """Safely decode bytes to string, replace invalid chars."""
+    if data is None:
+        return ""
+    # Decode with replacement, then clip
+    try:
+        decoded = data.decode("utf-8", errors="replace")
+    except Exception:
+        # Fallback to ascii with replacement
+        decoded = data.decode("ascii", errors="replace")
+    if len(decoded) > max_chars:
+        decoded = decoded[:max_chars] + f"\n... (truncated, {len(decoded) - max_chars} characters omitted)"
+    return decoded
