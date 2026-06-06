@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from rich.text import Text
+from textual import events
 from textual.binding import Binding
 from textual.message import Message
 from textual.widgets import Static, TextArea
@@ -33,11 +34,11 @@ class MessageBubble(Static):
 
 
 class PromptTextArea(TextArea):
-    """Multiline composer where Enter submits and Shift+Enter adds a line."""
+    """Multiline composer where Enter adds new line and Ctrl+Enter submits."""
 
     BINDINGS = [
-        Binding("enter", "submit_prompt", "Send", show=False, priority=True),
-        Binding("shift+enter", "insert_prompt_newline", "New line", show=False, priority=True),
+        Binding("enter", "insert_prompt_newline", "New line", show=False, priority=True),
+        Binding("ctrl+enter", "submit_prompt", "Send", show=False, priority=True),
         Binding("tab", "complete_prompt_command", "Complete command", show=False, priority=True),
     ]
 
