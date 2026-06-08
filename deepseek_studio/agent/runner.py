@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Generator
 from pathlib import Path
 
@@ -105,17 +106,27 @@ class AgentRunner:
 
             except Exception as e:
                 # Catch any unexpected error in the loop to prevent agent crash
+                error_type = type(e).__name__
+                error_msg = str(e)
+                classification = self._classify_error(e)
+                
                 if debug_mode:
-                    yield StreamEvent("tool", f"DEBUG - Unhandled exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                    yield StreamEvent("tool", f"DEBUG - {classification}: {error_type}: {error_msg}\n{traceback.format_exc()}")
                 else:
-                    yield StreamEvent("tool", f"Internal error: {type(e).__name__}: {e}")
+                    yield StreamEvent("tool", f"{classification}: {error_type}: {error_msg}")
+                
                 parse_failures += 1
                 if parse_failures >= 2:
-                    yield StreamEvent("response", "Agent encountered an unrecoverable error. Stopping.")
+                    yield StreamEvent("response", f"Agent encountered an unrecoverable error ({classification}). Stopping.")
                     yield StreamEvent("done", "")
                     return
-                # Try to recover by resetting prompt
-                prompt = make_parse_error_prompt(prompt, f"Internal error: {e}")
+                
+                # Generate adaptive recovery prompt based on error classification
+                recovery_prompt = self._make_recovery_prompt(prompt, classification, error_type, error_msg)
+                if recovery_prompt:
+                    prompt = recovery_prompt
+                else:
+                    prompt = make_parse_error_prompt(prompt, f"{classification}: {error_msg}")
                 continue
 
     def _collect_model_response(
@@ -161,6 +172,75 @@ class AgentRunner:
         if hidden_response_started:
             yield StreamEvent("activity_stop", "")
         return "".join(response_parts).strip(), latest_parent_id
+
+    @staticmethod
+    def _classify_error(error: Exception) -> str:
+        """Classify exception into a category for recovery."""
+        error_type = type(error).__name__
+        error_msg = str(error).lower()
+        
+        # Network/timeout errors
+        if any(x in error_type.lower() for x in ("timeout", "connection", "http")):
+            return "NETWORK_TIMEOUT"
+        # Tool execution errors (permission, not found, etc.)
+        if "permission denied" in error_msg or "access denied" in error_msg:
+            return "PERMISSION_DENIED"
+        if "not found" in error_msg and ("file" in error_msg or "directory" in error_msg or "command" in error_msg):
+            return "NOT_FOUND"
+        if "timeout" in error_msg:
+            return "TIMEOUT"
+        # Resource exhaustion
+        if "memory" in error_msg or "disk" in error_msg or "no space" in error_msg:
+            return "RESOURCE_EXHAUSTED"
+        # Parse errors
+        if error_type == "AgentParseError":
+            return "PARSE_ERROR"
+        # Default
+        return "UNEXPECTED"
+
+    def _make_recovery_prompt(self, original_prompt: str, classification: str, error_type: str, error_msg: str) -> str | None:
+        """Generate a recovery prompt based on error classification."""
+        if classification == "NETWORK_TIMEOUT":
+            return (
+                "A network timeout occurred while trying to reach the API. "
+                "Retry the same operation. The system will automatically retry. "
+                "If this persists, check your internet connection.\n\n"
+                f"Original prompt: {original_prompt[:500]}"
+            )
+        elif classification == "PERMISSION_DENIED":
+            return (
+                "A permission denied error occurred while using a tool. "
+                "If you are trying to write to a protected location, consider using a different path. "
+                "For commands that need higher privileges, you may set `allow_dangerous=True` in run_command.\n\n"
+                f"Original prompt: {original_prompt[:500]}"
+            )
+        elif classification == "NOT_FOUND":
+            return (
+                "A tool reported that a file, directory, or command was not found. "
+                "Verify the path exists before using it. Use `list_files` or `search_files` to explore.\n\n"
+                f"Original prompt: {original_prompt[:500]}"
+            )
+        elif classification == "TIMEOUT":
+            return (
+                "A tool execution timed out. Consider increasing the timeout parameter (e.g., timeout=60) "
+                "or breaking the operation into smaller steps.\n\n"
+                f"Original prompt: {original_prompt[:500]}"
+            )
+        elif classification == "RESOURCE_EXHAUSTED":
+            return (
+                "The system is low on resources (memory, disk space, etc.). "
+                "Consider freeing up resources or reducing the scope of the operation.\n\n"
+                f"Original prompt: {original_prompt[:500]}"
+            )
+        elif classification == "PARSE_ERROR":
+            # Let the standard parse error prompt handle this
+            return None
+        else:
+            return (
+                f"An unexpected error occurred: {error_type}: {error_msg}. "
+                "Please retry the last operation or simplify your request.\n\n"
+                f"Original prompt: {original_prompt[:500]}"
+            )
 
     @staticmethod
     def _format_tool_result(name: str, args: dict[str, object], result: ToolResult) -> str:

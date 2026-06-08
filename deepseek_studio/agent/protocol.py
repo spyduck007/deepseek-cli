@@ -128,12 +128,23 @@ def make_tool_result_prompt(tool_name: str, result_text: str) -> str:
 
 def make_parse_error_prompt(raw_response: str, error: str) -> str:
     clipped = raw_response[-4000:]
+    hints = []
+    if "trailing comma" in error.lower():
+        hints.append("Remove trailing commas before closing brackets/braces.")
+    if "unquoted" in error.lower() or "expecting property name" in error.lower():
+        hints.append("Ensure all keys are double-quoted. Use \"key\": value.")
+    if "single quote" in error.lower():
+        hints.append("Use double quotes for strings and keys, not single quotes.")
+    if "control character" in error.lower():
+        hints.append("Escape control characters (e.g., newlines as \\n).")
+    hint_text = "\n".join("- " + h for h in hints) if hints else ""
     return (
         "Your previous response did not follow the required JSON protocol.\n"
         + f"Parse error: {error}\n\n"
+        + (f"Common fixes:\n{hint_text}\n\n" if hint_text else "")
         + "Previous response excerpt:\n"
         + clipped
-        + "\n\nRespond again with exactly one JSON object and no markdown."
+        + "\n\nRespond again with exactly one JSON object and no markdown. Wrap your JSON in ```json ... ``` if helpful."
     )
 
 
