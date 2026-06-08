@@ -45,60 +45,78 @@ class AgentRunner:
         search_enabled: bool = False,
     ) -> Generator[StreamEvent, None, None]:
         """Run an agent task, yielding UI events."""
+        import os
+        import traceback
+        debug_mode = os.environ.get("DEEPSEEK_AGENT_DEBUG") == "1"
         prompt = make_initial_agent_prompt(str(self.workspace), self.tools.schema_text(), task)
         parse_failures = 0
         current_parent_id = parent_id
-
         while True:
-            yield StreamEvent("status", "Working")
-            yield StreamEvent("thinking_start", "")
-            yield StreamEvent("usage_prompt", prompt)
-            model_text, current_parent_id = yield from self._collect_model_response(
-                session_id,
-                prompt,
-                parent_id=current_parent_id,
-                thinking_enabled=thinking_enabled,
-                emit_thinking=stream_thinking,
-                search_enabled=search_enabled,
-            )
-            yield StreamEvent("usage_response", model_text)
-
             try:
-                action = parse_agent_action(model_text)
-            except AgentParseError as exc:
-                parse_failures += 1
-                yield StreamEvent("tool", f"Protocol error: {exc}")
-                if parse_failures >= 2:
-                    yield StreamEvent(
-                        "response",
-                        "I could not get a valid tool/final JSON response after two tries. "
-                        "Here is the last raw response:\n\n" + model_text,
-                    )
+                yield StreamEvent("status", "Working")
+                yield StreamEvent("thinking_start", "")
+                yield StreamEvent("usage_prompt", prompt)
+                model_text, current_parent_id = yield from self._collect_model_response(
+                    session_id,
+                    prompt,
+                    parent_id=current_parent_id,
+                    thinking_enabled=thinking_enabled,
+                    emit_thinking=stream_thinking,
+                    search_enabled=search_enabled,
+                )
+                yield StreamEvent("usage_response", model_text)
+
+                try:
+                    action = parse_agent_action(model_text)
+                except AgentParseError as exc:
+                    parse_failures += 1
+                    yield StreamEvent("tool", f"Protocol error: {exc}")
+                    if parse_failures >= 2:
+                        yield StreamEvent(
+                            "response",
+                            "I could not get a valid tool/final JSON response after two tries. "
+                            "Here is the last raw response:\n\n" + model_text,
+                        )
+                        yield StreamEvent("done", "")
+                        return
+                    prompt = make_parse_error_prompt(model_text, str(exc))
+                    continue
+
+                parse_failures = 0
+                if action.status:
+                    yield StreamEvent("status", action.status)
+
+                if action.is_final:
+                    yield StreamEvent("agent_final", action.final or "")
                     yield StreamEvent("done", "")
                     return
-                prompt = make_parse_error_prompt(model_text, str(exc))
+
+                if not action.is_tool_call:
+                    yield StreamEvent("agent_final", "Agent stopped without a final answer or tool call.")
+                    yield StreamEvent("done", "")
+                    return
+
+                tool_name = action.tool_name or ""
+                tool_args = action.tool_args or {}
+                yield StreamEvent("status", f"Running {tool_name}")
+                result = self.tools.execute(tool_name, tool_args)
+                yield StreamEvent("tool", self._format_tool_result(tool_name, tool_args, result))
+                prompt = make_tool_result_prompt(tool_name, result.for_model())
+
+            except Exception as e:
+                # Catch any unexpected error in the loop to prevent agent crash
+                if debug_mode:
+                    yield StreamEvent("tool", f"DEBUG - Unhandled exception: {type(e).__name__}: {e}\n{traceback.format_exc()}")
+                else:
+                    yield StreamEvent("tool", f"Internal error: {type(e).__name__}: {e}")
+                parse_failures += 1
+                if parse_failures >= 2:
+                    yield StreamEvent("response", "Agent encountered an unrecoverable error. Stopping.")
+                    yield StreamEvent("done", "")
+                    return
+                # Try to recover by resetting prompt
+                prompt = make_parse_error_prompt(prompt, f"Internal error: {e}")
                 continue
-
-            parse_failures = 0
-            if action.status:
-                yield StreamEvent("status", action.status)
-
-            if action.is_final:
-                yield StreamEvent("agent_final", action.final or "")
-                yield StreamEvent("done", "")
-                return
-
-            if not action.is_tool_call:
-                yield StreamEvent("agent_final", "Agent stopped without a final answer or tool call.")
-                yield StreamEvent("done", "")
-                return
-
-            tool_name = action.tool_name or ""
-            tool_args = action.tool_args or {}
-            yield StreamEvent("status", f"Running {tool_name}")
-            result = self.tools.execute(tool_name, tool_args)
-            yield StreamEvent("tool", self._format_tool_result(tool_name, tool_args, result))
-            prompt = make_tool_result_prompt(tool_name, result.for_model())
 
     def _collect_model_response(
         self,

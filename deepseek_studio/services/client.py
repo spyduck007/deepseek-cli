@@ -87,6 +87,42 @@ class DeepSeekClient:
         compact activity indicator, and sends one aggregate usage event when
         the thinking phase ends.
         """
+        import time
+        max_retries = 3
+        base_delay = 1
+        for attempt in range(max_retries + 1):
+            try:
+                yield from self._stream_message_impl(
+                    session_id, prompt, parent_id=parent_id,
+                    thinking_enabled=thinking_enabled, emit_thinking=emit_thinking,
+                    search_enabled=search_enabled
+                )
+                return
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt == max_retries:
+                    yield StreamEvent("error", f"Network error after {max_retries} retries: {e}")
+                    yield StreamEvent("done", "")
+                    return
+                delay = base_delay * (2 ** attempt)
+                yield StreamEvent("status", f"Retrying ({attempt+1}/{max_retries}) in {delay}s...")
+                time.sleep(delay)
+            except Exception as e:
+                # Non-retryable error
+                yield StreamEvent("error", f"Request failed: {type(e).__name__}: {e}")
+                yield StreamEvent("done", "")
+                return
+
+    def _stream_message_impl(
+        self,
+        session_id: str,
+        prompt: str,
+        *,
+        parent_id: int | None = None,
+        thinking_enabled: bool = False,
+        emit_thinking: bool = True,
+        search_enabled: bool = False,
+    ) -> Generator[StreamEvent, None, None]:
+        """Internal implementation with actual streaming."""
         yield StreamEvent("status", "Solving proof-of-work...")
         pow_header = self.get_pow_header()
         yield StreamEvent("status", "Streaming response...")

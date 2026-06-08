@@ -141,15 +141,49 @@ def _parse_json_object(text: str) -> dict[str, Any]:
     candidates = _json_candidates(text)
     errors: list[str] = []
     for candidate in candidates:
+        # Attempt direct parse
         try:
             parsed = json.loads(candidate)
         except json.JSONDecodeError as exc:
-            errors.append(str(exc))
-            continue
+            # Try to repair common issues
+            repaired = _attempt_json_repair(candidate)
+            if repaired is not None:
+                try:
+                    parsed = json.loads(repaired)
+                except json.JSONDecodeError as repair_exc:
+                    errors.append(f"direct: {exc}; repair: {repair_exc}")
+                    continue
+            else:
+                errors.append(str(exc))
+                continue
         if isinstance(parsed, dict):
             return parsed
         errors.append("top-level JSON was not an object")
     raise AgentParseError("Could not parse JSON object" + (f": {errors[-1]}" if errors else ""))
+
+
+def _attempt_json_repair(text: str) -> str | None:
+    """Attempt to fix common JSON issues like trailing commas, unquoted keys, etc."""
+    # Remove trailing commas before closing brackets/braces
+    import re
+    # Remove trailing commas in objects and arrays
+    repaired = re.sub(r',\s*}', '}', text)
+    repaired = re.sub(r',\s*]', ']', repaired)
+    # Add missing quotes around keys (simple heuristic: word followed by colon)
+    repaired = re.sub(r'(\b[a-zA-Z_][a-zA-Z0-9_]*\b)\s*:', r'"\1":', repaired)
+    # Replace single quotes with double quotes (only if it doesn't break strings)
+    # Simple approach: assume single quotes are used for keys/strings
+    if "'" in repaired and '"' not in repaired:
+        repaired = repaired.replace("'", '"')
+    # Escape unescaped control characters
+    repaired = re.sub(r'[\x00-\x1f\x7f-\x9f]', lambda m: f'\\u{ord(m.group(0)):04x}', repaired)
+    # Remove BOM
+    if repaired.startswith('\ufeff'):
+        repaired = repaired[1:]
+    # If no change, return None
+    if repaired == text:
+        return None
+    return repaired
 
 
 def _json_candidates(text: str) -> list[str]:

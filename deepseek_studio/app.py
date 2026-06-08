@@ -530,4 +530,45 @@ class DeepSeekTUI(App[None]):
 
 
 def main() -> None:
-    DeepSeekTUI().run()
+    import sys
+    import signal
+    import traceback
+    import os
+
+    debug_mode = os.environ.get("DEEPSEEK_AGENT_DEBUG") == "1"
+
+    def excepthook(exc_type, exc_value, exc_tb):
+        """Global exception hook to log and show error before exit."""
+        error_msg = f"Unhandled exception: {exc_type.__name__}: {exc_value}"
+        if debug_mode:
+            error_msg += f"\n{traceback.format_exc()}"
+        print(error_msg, file=sys.stderr)
+        # Try to show in TUI if running
+        try:
+            from textual.app import App
+            app = App.get_app()
+            if app and hasattr(app, '_system'):
+                app.call_from_thread(app._system, f"CRASH: {error_msg[:500]}")
+        except Exception:
+            pass
+
+    def sig_handler(signum, frame):
+        print(f"Received signal {signum}, exiting gracefully...", file=sys.stderr)
+        sys.exit(128 + signum)
+
+    # Install hooks
+    sys.excepthook = excepthook
+    signal.signal(signal.SIGINT, sig_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
+
+    # Run the app
+    try:
+        DeepSeekTUI().run()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        sys.exit(0)
+    except Exception as e:
+        if debug_mode:
+            traceback.print_exc()
+        print(f"Fatal error: {e}", file=sys.stderr)
+        sys.exit(1)
