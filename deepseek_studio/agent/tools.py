@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import signal
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -60,12 +61,92 @@ class ToolSpec:
 
 
 class ToolRegistry:
-    """Registry for filesystem and command tools."""
+    """Registry for filesystem and command tools with caching."""
 
-    def __init__(self, workspace: str | Path | None = None) -> None:
+    # Tools that are read-only and safe to cache
+    CACHEABLE_TOOLS = {
+        "workspace_info",
+        "list_files",
+        "read_file",
+        "search_files",
+        "git_status",
+        "git_diff",
+        "git_log",
+        "git_branch",
+    }
+
+    # Tools that modify the filesystem and should invalidate cache
+    WRITE_TOOLS = {
+        "write_file",
+        "edit_file",
+        "mkdir",
+        "delete_path",
+        "apply_patch",
+        "git_add",
+        "git_commit",
+        "git_checkout",
+        "git_pull",
+        "git_push",
+    }
+
+    def __init__(self, workspace: str | Path | None = None, cache_maxsize: int = 128) -> None:
         self.workspace = Path(workspace or os.getcwd()).expanduser().resolve()
         self._tools: dict[str, tuple[ToolSpec, Callable[..., ToolResult]]] = {}
+        self._cache: OrderedDict[tuple[str, frozenset], ToolResult] = OrderedDict()
+        self._cache_maxsize = cache_maxsize
         self._register_defaults()
+
+    def _cache_key(self, name: str, args: dict[str, Any]) -> tuple[str, frozenset]:
+        """Create a cache key from tool name and normalized arguments."""
+        # Convert args to a sorted tuple of (key, value) to ensure consistent ordering
+        items = sorted((k, v) for k, v in args.items())
+        return (name, frozenset(items))
+
+    def _get_cached(self, name: str, args: dict[str, Any]) -> ToolResult | None:
+        """Retrieve cached result if exists and not expired."""
+        if name not in self.CACHEABLE_TOOLS:
+            return None
+        key = self._cache_key(name, args)
+        if key in self._cache:
+            # Move to end for LRU
+            self._cache.move_to_end(key)
+            return self._cache[key]
+        return None
+
+    def _set_cached(self, name: str, args: dict[str, Any], result: ToolResult) -> None:
+        """Store result in cache, evicting oldest if full."""
+        if name not in self.CACHEABLE_TOOLS:
+            return
+        key = self._cache_key(name, args)
+        self._cache[key] = result
+        self._cache.move_to_end(key)
+        if len(self._cache) > self._cache_maxsize:
+            self._cache.popitem(last=False)
+
+    def _invalidate_path(self, path: str | Path) -> None:
+        """Invalidate cache entries that involve a given path."""
+        path_str = str(Path(path).resolve())
+        keys_to_delete = []
+        for key in self._cache:
+            tool_name, args_frozen = key
+            args = dict(args_frozen)
+            # Check if any argument value contains the path
+            for arg_name, arg_value in args.items():
+                if arg_name in ("path", "paths"):
+                    if isinstance(arg_value, str) and path_str in arg_value:
+                        keys_to_delete.append(key)
+                        break
+                elif arg_name == "query":
+                    # search_files query might match many files; safe to invalidate all
+                    if tool_name == "search_files":
+                        keys_to_delete.append(key)
+                        break
+        for key in keys_to_delete:
+            del self._cache[key]
+
+    def _invalidate_all(self) -> None:
+        """Clear entire cache."""
+        self._cache.clear()
 
     def set_workspace(self, workspace: str | Path) -> None:
         path = Path(workspace).expanduser().resolve()
@@ -84,9 +165,21 @@ class ToolRegistry:
     def execute(self, name: str, args: dict[str, Any] | None = None) -> ToolResult:
         if name not in self._tools:
             return ToolResult(False, f"Unknown tool: {name}. Available: {', '.join(self.list_tool_names())}")
+        
+        args_dict = args or {}
+        
+        # Check cache for read-only tools
+        cached = self._get_cached(name, args_dict)
+        if cached is not None:
+            return cached
+        
         _, func = self._tools[name]
         try:
-            return func(**(args or {}))
+            result = func(**args_dict)
+            # Cache successful results of read-only tools
+            if result.ok and name in self.CACHEABLE_TOOLS:
+                self._set_cached(name, args_dict, result)
+            return result
         except TypeError as exc:
             return ToolResult(False, f"Bad arguments for {name}: {exc}")
         except Exception as exc:  # noqa: BLE001 - tool errors should go back to the model
@@ -397,6 +490,7 @@ class ToolRegistry:
         elif not file_path.parent.exists():
             return ToolResult(False, f"Parent directory does not exist: {self._rel(file_path.parent)}")
         file_path.write_text(str(content), encoding="utf-8")
+        self._invalidate_path(file_path)
         return ToolResult(True, f"Wrote {len(str(content))} characters to {self._rel(file_path)}")
 
     def edit_file(self, path: str, old: str, new: str, replace_all: bool = False) -> ToolResult:
@@ -416,11 +510,13 @@ class ToolRegistry:
         updated = text.replace(old, new) if replace_all else text.replace(old, new, 1)
         file_path.write_text(updated, encoding="utf-8")
         changed = count if replace_all else 1
+        self._invalidate_path(file_path)
         return ToolResult(True, f"Edited {self._rel(file_path)} ({changed} replacement{'s' if changed != 1 else ''}).")
 
     def mkdir(self, path: str) -> ToolResult:
         dir_path = self._safe_path(path)
         dir_path.mkdir(parents=True, exist_ok=True)
+        self._invalidate_path(dir_path)
         return ToolResult(True, f"Created directory {self._rel(dir_path)}")
 
     def delete_path(self, path: str, recursive: bool = False) -> ToolResult:
@@ -433,10 +529,13 @@ class ToolRegistry:
             if recursive:
                 import shutil
                 shutil.rmtree(target)
+                self._invalidate_path(target)
                 return ToolResult(True, f"Deleted directory tree {self._rel(target)}")
             target.rmdir()
+            self._invalidate_path(target)
             return ToolResult(True, f"Deleted empty directory {self._rel(target)}")
         target.unlink()
+        self._invalidate_path(target)
         return ToolResult(True, f"Deleted file {self._rel(target)}")
 
     def search_files(
@@ -613,6 +712,7 @@ class ToolRegistry:
             )
             if apply.returncode != 0:
                 return ToolResult(False, "git apply failed\n" + _clip(apply.stderr or apply.stdout, 8000))
+            self._invalidate_all()
             return ToolResult(True, "Patch applied successfully.")
         finally:
             try:
