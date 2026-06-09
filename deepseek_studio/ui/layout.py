@@ -23,7 +23,7 @@ def compose_shell() -> ComposeResult:
             with VerticalScroll(id="transcript"):
                 pass
             with Container(id="composer"):
-                yield Static("MESSAGE  ·  Enter sends  ·  Shift+Enter adds a new line", id="composer-title")
+                yield Static("MESSAGE  ·  Enter adds new line  ·  Ctrl+Enter sends", id="composer-title")
                 prompt = PromptTextArea("", id="prompt")
                 prompt.show_line_numbers = False
                 prompt.soft_wrap = True
